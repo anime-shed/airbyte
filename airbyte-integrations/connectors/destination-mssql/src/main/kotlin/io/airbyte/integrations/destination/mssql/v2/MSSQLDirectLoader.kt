@@ -38,9 +38,15 @@ class MSSQLDirectLoader(
     private val sqlBuilder = state.sqlBuilder
     private val connection = state.dataSource.connection.also { it.autoCommit = false }
     private val identityInsertEnabled =
-        sqlBuilder.isForeignTable && sqlBuilder.hasIdentityColumn(connection).also { hasIdentity ->
-            if (hasIdentity) sqlBuilder.setIdentityInsert(connection, true)
-        }
+        sqlBuilder.isForeignTable &&
+            sqlBuilder.hasIdentityColumn(connection).also { hasIdentity ->
+                if (hasIdentity) {
+                    log.info {
+                        "Foreign table has an identity column; enabling IDENTITY_INSERT for this session"
+                    }
+                    sqlBuilder.setIdentityInsert(connection, true)
+                }
+            }
     private val preparedStatement =
         connection.prepareStatement(state.sqlBuilder.getFinalTableInsertColumnHeader().trimIndent())
 
