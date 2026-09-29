@@ -27,4 +27,4 @@ jobs:
         with:
           context: airbyte-integrations/connectors/destination-mssql/foreign-image
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/destination-mssql:2.2.22-fa3
+          tags: ghcr.io/${{ github.repository_owner }}/destination-mssql:2.2.22-fa4

@@ -98,6 +98,25 @@ object MSSQLValueCoercer {
     }
 
     /**
+     * Coercion for user-managed ("foreign") tables. Never nullifies out-of-range values: the
+     * destination's own column types and constraints are authoritative. Only serialises
+     * complex types to a JSON string for nvarchar binding.
+     */
+    fun coerceForForeignTable(value: EnrichedAirbyteValue) {
+        if (value.abValue is NullValue) return
+        when (value.type) {
+            is ArrayType,
+            ArrayTypeWithoutSchema,
+            is ObjectType,
+            ObjectTypeWithEmptySchema,
+            ObjectTypeWithoutSchema,
+            is UnionType,
+            is UnknownType -> value.abValue = StringValue(value.abValue.serializeToString())
+            else -> {}
+        }
+    }
+
+    /**
      * Validates that the timestamp value is within the MSSQL DATETIME range (>= 1753-01-01). If
      * not, the value is nullified and `null` is returned.
      */
