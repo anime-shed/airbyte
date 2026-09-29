@@ -465,6 +465,27 @@ class MSSQLQueryBuilder(
             .executeUpdate(connection)
     }
 
+    /**
+     * Binds the field's raw JSON text for a user-managed table. SQL Server implicitly converts
+     * nvarchar literals to the target column type (datetime2, bigint, float, bit,
+     * uniqueidentifier, ...). Used when the enriched/coerced value is missing or was
+     * nullified upstream, so real values are never silently dropped on foreign tables.
+     */
+    private fun bindRawValue(
+        statement: PreparedStatement,
+        statementIndex: Int,
+        field: NamedField,
+        rawJson: com.fasterxml.jackson.databind.JsonNode
+    ): Boolean {
+        val node = rawJson.get(field.name) ?: return false
+        if (node.isNull) return false
+        statement.setString(
+            statementIndex,
+            if (node.isValueNode) node.asText() else node.toString()
+        )
+        return true
+    }
+
     fun populateStatement(
         statement: PreparedStatement,
         plainRecord: DestinationRecordRaw,
@@ -472,13 +493,16 @@ class MSSQLQueryBuilder(
     ) {
         val enrichedRecord = plainRecord.asEnrichedDestinationRecordAirbyteValue()
         val populatedFields = enrichedRecord.allTypedFields
+        val rawJson by lazy(LazyThreadSafetyMode.NONE) { plainRecord.asJsonRecord() }
 
         var airbyteMetaStatementIndex: Int? = null
         schema.forEachIndexed { index, field ->
             val statementIndex = index + 1
             val value = populatedFields[field.name]
             if (value == null || value.abValue == NullValue) {
-                statement.setAsNullValue(statementIndex, field.type.type)
+                if (!isForeignTable || !bindRawValue(statement, statementIndex, field, rawJson)) {
+                    statement.setAsNullValue(statementIndex, field.type.type)
+                }
                 return@forEachIndexed
             }
             if (value.airbyteMetaField == Meta.AirbyteMetaFields.META) {
@@ -490,10 +514,17 @@ class MSSQLQueryBuilder(
                 return@forEachIndexed
             }
 
-            // Apply shared MSSQL coercion: range validation + complex-type serialisation
-            MSSQLValueCoercer.coerce(value)
+            // Apply shared MSSQL coercion: range validation + complex-type serialisation.
+            // Foreign tables skip range nullification — the real column types decide validity.
+            if (isForeignTable) {
+                MSSQLValueCoercer.coerceForForeignTable(value)
+            } else {
+                MSSQLValueCoercer.coerce(value)
+            }
             if (value.abValue is NullValue) {
-                statement.setAsNullValue(statementIndex, field.type.type)
+                if (!isForeignTable || !bindRawValue(statement, statementIndex, field, rawJson)) {
+                    statement.setAsNullValue(statementIndex, field.type.type)
+                }
                 return@forEachIndexed
             }
 
