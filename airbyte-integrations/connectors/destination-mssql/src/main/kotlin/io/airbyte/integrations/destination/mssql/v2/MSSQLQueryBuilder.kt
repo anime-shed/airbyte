@@ -162,6 +162,19 @@ const val MERGE_INTO_QUERY =
         ;
     """
 
+// Insert-only variant used for user-managed (foreign) tables: new rows are
+// inserted, rows that already exist on the target are left untouched.
+const val MERGE_INSERT_ONLY_QUERY =
+    """
+        SET NOCOUNT ON;
+        MERGE INTO [?$SCHEMA_KEY].[?$TABLE_KEY] WITH (TABLOCK) AS Target
+        USING (VALUES (?$TEMPLATE_COLUMNS_KEY)) AS Source (?$COLUMNS_KEY)
+        ON ?$UNIQUENESS_CONSTRAINT_KEY
+        WHEN NOT MATCHED BY TARGET THEN
+            INSERT (?$COLUMNS_KEY) VALUES (?$COLUMNS_KEY)
+        ;
+    """
+
 const val ALTER_TABLE_ADD = """
         ALTER TABLE [?].[?]
         ADD [?] ? NULL;
@@ -250,13 +263,37 @@ class MSSQLQueryBuilder(
     private val indexedColumns: Set<String> =
         if (hasCdc) uniquenessKey.toSet() + AIRBYTE_CDC_DELETED_AT else uniquenessKey.toSet()
 
+    /**
+     * A table that already exists but lacks Airbyte's internal metadata columns is treated as
+     * user-managed ("foreign"): no DDL is ever issued against it, writes use stream columns
+     * only, and dedupe merges insert new keys without updating existing rows.
+     */
+    @Volatile var isForeignTable: Boolean = false
+        private set
+
+    private val dataTableSchema: List<NamedField> by lazy { extractFinalTableSchema() }
+
+    /** Schema used for INSERT/MERGE statements: stream columns only for foreign tables. */
+    val insertTableSchema: List<NamedField>
+        get() = if (isForeignTable) dataTableSchema else finalTableSchema
+
     private fun getExistingSchema(connection: Connection): List<NamedSqlField> {
         val fields = mutableListOf<NamedSqlField>()
         GET_EXISTING_SCHEMA_QUERY.executeQuery(connection, outputSchema, tableName) { rs ->
             while (rs.next()) {
                 val name = rs.getString("COLUMN_NAME")
-                val type = MssqlType.valueOf(rs.getString("DATA_TYPE").uppercase())
-                fields.add(NamedSqlField(name, type))
+                val typeName = rs.getString("DATA_TYPE").uppercase()
+                val type =
+                    runCatching { MssqlType.valueOf(typeName) }.getOrElse {
+                        logger.warn {
+                            "Column $name in [$outputSchema].[$tableName] has unsupported" +
+                                " type $typeName; skipping it in schema comparison"
+                        }
+                        null
+                    }
+                if (type != null) {
+                    fields.add(NamedSqlField(name, type))
+                }
             }
         }
         return fields
@@ -267,6 +304,18 @@ class MSSQLQueryBuilder(
 
     fun updateSchema(connection: Connection) {
         val existingSchema = getExistingSchema(connection)
+
+        // A pre-existing table without Airbyte's internal columns is user-managed.
+        // Never run DDL against it; writes will use stream columns only.
+        if (existingSchema.isNotEmpty() && existingSchema.none { it.name in airbyteFields }) {
+            isForeignTable = true
+            logger.warn {
+                "Table [$outputSchema].[$tableName] is user-managed;" +
+                    " skipping schema evolution"
+            }
+            return
+        }
+
         val expectedSchema = getSchema()
 
         val existingFields = existingSchema.associate { it.name to it.type }
@@ -327,17 +376,59 @@ class MSSQLQueryBuilder(
     }
 
     fun dropTable(connection: Connection) {
+        if (isForeignTable) {
+            logger.warn { "Refusing to drop user-managed table [$outputSchema].[$tableName]" }
+            return
+        }
         DROP_TABLE_QUERY.toQuery(outputSchema, tableName).executeUpdate(connection)
     }
 
     fun getFinalTableInsertColumnHeader(): String =
-        getFinalTableInsertColumnHeader(finalTableSchema)
+        if (isForeignTable) {
+            getForeignTableInsertColumnHeader(dataTableSchema)
+        } else {
+            getFinalTableInsertColumnHeader(finalTableSchema)
+        }
 
-    fun deleteCdc(connection: Connection) =
+    private fun getForeignTableInsertColumnHeader(schema: List<NamedField>): String {
+        val columns = schema.joinToString(", ") { "[${it.name}]" }
+        val templateColumns = schema.joinToString(", ") { "?" }
+        if (uniquenessKey.isEmpty()) {
+            return INSERT_INTO_QUERY.toQuery(
+                mapOf(
+                    SCHEMA_KEY to outputSchema,
+                    TABLE_KEY to tableName,
+                    COLUMNS_KEY to columns,
+                    TEMPLATE_COLUMNS_KEY to templateColumns,
+                )
+            )
+        }
+        // Insert new keys only; never UPDATE rows that already exist on a user-managed table.
+        val uniquenessConstraint =
+            uniquenessKey.joinToString(" AND ") { "Target.[$it] = Source.[$it]" }
+        return MERGE_INSERT_ONLY_QUERY.toQuery(
+            mapOf(
+                SCHEMA_KEY to outputSchema,
+                TABLE_KEY to tableName,
+                TEMPLATE_COLUMNS_KEY to templateColumns,
+                COLUMNS_KEY to columns,
+                UNIQUENESS_CONSTRAINT_KEY to uniquenessConstraint,
+            )
+        )
+    }
+
+    fun deleteCdc(connection: Connection) {
+        if (isForeignTable) {
+            return
+        }
         DELETE_WHERE_COL_IS_NOT_NULL.toQuery(outputSchema, tableName, AIRBYTE_CDC_DELETED_AT)
             .executeUpdate(connection)
+    }
 
-    fun deletePreviousGenerations(connection: Connection, minGenerationId: Long) =
+    fun deletePreviousGenerations(connection: Connection, minGenerationId: Long) {
+        if (isForeignTable) {
+            return
+        }
         DELETE_WHERE_COL_LESS_THAN.toQuery(
                 outputSchema,
                 tableName,
@@ -345,6 +436,7 @@ class MSSQLQueryBuilder(
                 minGenerationId.toString(),
             )
             .executeUpdate(connection)
+    }
 
     fun populateStatement(
         statement: PreparedStatement,
@@ -514,7 +606,10 @@ class MSSQLQueryBuilder(
     }
 
     private fun extractFinalTableSchema(): List<NamedField> =
-        stream.schema.asColumns().map { NamedField(name = it.key, type = it.value) }.toList()
+        stream.schema.asColumns()
+            .filter { it.key !in airbyteFields }
+            .map { NamedField(name = it.key, type = it.value) }
+            .toList()
 
     private fun airbyteTypeToSqlSchema(
         schema: List<NamedField>,

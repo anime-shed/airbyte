@@ -43,7 +43,7 @@ class MSSQLDirectLoader(
     override suspend fun accept(
         record: DestinationRecordRaw,
     ): DirectLoader.DirectLoadResult {
-        sqlBuilder.populateStatement(preparedStatement, record, sqlBuilder.finalTableSchema)
+        sqlBuilder.populateStatement(preparedStatement, record, sqlBuilder.insertTableSchema)
         preparedStatement.addBatch()
 
         // Periodically execute the batch to avoid too-large batches
