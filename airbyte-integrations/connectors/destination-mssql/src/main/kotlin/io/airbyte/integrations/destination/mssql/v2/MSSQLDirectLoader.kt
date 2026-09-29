@@ -37,6 +37,10 @@ class MSSQLDirectLoader(
             ?: throw IllegalStateException("No state found for stream $streamDescriptor.")
     private val sqlBuilder = state.sqlBuilder
     private val connection = state.dataSource.connection.also { it.autoCommit = false }
+    private val identityInsertEnabled =
+        sqlBuilder.isForeignTable && sqlBuilder.hasIdentityColumn(connection).also { hasIdentity ->
+            if (hasIdentity) sqlBuilder.setIdentityInsert(connection, true)
+        }
     private val preparedStatement =
         connection.prepareStatement(state.sqlBuilder.getFinalTableInsertColumnHeader().trimIndent())
 
@@ -94,6 +98,10 @@ class MSSQLDirectLoader(
 
     override fun close() {
         log.info { "Closing connection for batch $batch" }
+        if (identityInsertEnabled) {
+            runCatching { sqlBuilder.setIdentityInsert(connection, false) }
+                .onFailure { log.warn(it) { "Failed to reset IDENTITY_INSERT" } }
+        }
         connection.close()
     }
 }

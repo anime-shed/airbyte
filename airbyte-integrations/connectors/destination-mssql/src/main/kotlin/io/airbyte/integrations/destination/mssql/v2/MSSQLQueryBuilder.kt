@@ -204,6 +204,15 @@ const val DELETE_WHERE_COL_LESS_THAN =
         WHERE [?] < ?
     """
 
+const val HAS_IDENTITY_COLUMN_QUERY =
+    """
+        SELECT COUNT(*)
+        FROM sys.columns c
+        JOIN sys.tables t ON c.object_id = t.object_id
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE s.name = ? AND t.name = ? AND c.is_identity = 1
+    """
+
 const val SELECT_FROM = """
         SELECT *
         FROM [?].[?]
@@ -415,6 +424,20 @@ class MSSQLQueryBuilder(
                 UNIQUENESS_CONSTRAINT_KEY to uniquenessConstraint,
             )
         )
+    }
+
+    /**
+     * True when a user-managed table has an IDENTITY column. Explicit identity values then
+     * require SET IDENTITY_INSERT ON for the session (a session flag, not DDL).
+     */
+    fun hasIdentityColumn(connection: Connection): Boolean =
+        HAS_IDENTITY_COLUMN_QUERY.executeQuery(connection, outputSchema, tableName) { rs ->
+            rs.next() && rs.getInt(1) > 0
+        }
+
+    fun setIdentityInsert(connection: Connection, enabled: Boolean) {
+        "SET IDENTITY_INSERT [$outputSchema].[$tableName] ${if (enabled) "ON" else "OFF"}"
+            .executeUpdate(connection)
     }
 
     fun deleteCdc(connection: Connection) {
