@@ -436,8 +436,12 @@ class MSSQLQueryBuilder(
         }
 
     fun setIdentityInsert(connection: Connection, enabled: Boolean) {
-        "SET IDENTITY_INSERT [$outputSchema].[$tableName] ${if (enabled) "ON" else "OFF"}"
-            .executeUpdate(connection)
+        // Must go through a raw Statement (TDS batch). PreparedStatement executes as an
+        // sp_executesql RPC whose SET options revert when the nested batch returns.
+        val sql =
+            "SET IDENTITY_INSERT [$outputSchema].[$tableName] ${if (enabled) "ON" else "OFF"}"
+        connection.createStatement().use { it.execute(sql) }
+        logger.info { "IDENTITY_INSERT [$outputSchema].[$tableName] set to ${if (enabled) "ON" else "OFF"}" }
     }
 
     fun deleteCdc(connection: Connection) {
