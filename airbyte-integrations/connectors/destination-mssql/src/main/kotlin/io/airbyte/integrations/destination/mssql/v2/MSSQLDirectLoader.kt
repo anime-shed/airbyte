@@ -29,14 +29,17 @@ class MSSQLDirectLoader(
     private val recordCommitBatchSize = config.batchEveryNRecords
     private val maxBatchDataSize = config.maxBatchSizeBytes
 
-    private var rows: Long = 0
+    private companion object {
+        const val MAX_BATCH_ATTEMPTS = 5
+    }
+
     private var dataSize: Long = 0
 
     private val state =
         (stateStore.get(streamDescriptor) as MSSQLDirectLoaderStreamState?)
             ?: throw IllegalStateException("No state found for stream $streamDescriptor.")
     private val sqlBuilder = state.sqlBuilder
-    private val connection = state.dataSource.connection.also { it.autoCommit = false }
+    private var connection = state.dataSource.connection.also { it.autoCommit = false }
     private val identityInsertEnabled =
         sqlBuilder.isForeignTable &&
             sqlBuilder.hasIdentityColumn(connection).also { hasIdentity ->
@@ -47,17 +50,17 @@ class MSSQLDirectLoader(
                     sqlBuilder.setIdentityInsert(connection, true)
                 }
             }
-    private val preparedStatement =
+    private var preparedStatement =
         connection.prepareStatement(state.sqlBuilder.getFinalTableInsertColumnHeader().trimIndent())
+    private val pendingRecords = ArrayList<DestinationRecordRaw>(recordCommitBatchSize)
 
     override suspend fun accept(
         record: DestinationRecordRaw,
     ): DirectLoader.DirectLoadResult {
-        sqlBuilder.populateStatement(preparedStatement, record, sqlBuilder.insertTableSchema)
-        preparedStatement.addBatch()
+        pendingRecords.add(record)
 
         // Periodically execute the batch to avoid too-large batches
-        if (++rows % recordCommitBatchSize == 0L) {
+        if (pendingRecords.size >= recordCommitBatchSize) {
             executeBatchSafely()
         }
 
@@ -72,18 +75,57 @@ class MSSQLDirectLoader(
         return DirectLoader.Incomplete
     }
 
+    private fun isConnectionFailure(e: SQLException): Boolean =
+        e.sqlState?.startsWith("08") == true ||
+            e.message?.contains("Connection reset", ignoreCase = true) == true ||
+            e.message?.contains("Connection is closed", ignoreCase = true) == true
+
+    private fun reconnect() {
+        runCatching { preparedStatement.close() }
+        runCatching { connection.close() }
+        connection = state.dataSource.connection.also { it.autoCommit = false }
+        if (identityInsertEnabled) {
+            sqlBuilder.setIdentityInsert(connection, true)
+        }
+        preparedStatement =
+            connection.prepareStatement(
+                state.sqlBuilder.getFinalTableInsertColumnHeader().trimIndent()
+            )
+    }
+
     private fun executeBatchSafely() {
         // This is to prevent deadlock errors that will nuke the transaction.
         // TODO: Promote direct loader to use suspend functions so this can use a suspending mutex
         synchronized(parent) {
-            try {
-                preparedStatement.executeBatch()
-            } catch (e: SQLException) {
-                MSSQLErrorClassifier.rethrowClassified(e)
+            repeat(MAX_BATCH_ATTEMPTS) { attempt ->
+                try {
+                    preparedStatement.clearBatch()
+                    for (record in pendingRecords) {
+                        sqlBuilder.populateStatement(
+                            preparedStatement,
+                            record,
+                            sqlBuilder.insertTableSchema
+                        )
+                        preparedStatement.addBatch()
+                    }
+                    preparedStatement.executeBatch()
+                    preparedStatement.clearBatch()
+                    preparedStatement.clearParameters()
+                    connection.commit()
+                    pendingRecords.clear()
+                    return
+                } catch (e: SQLException) {
+                    if (!isConnectionFailure(e) || attempt == MAX_BATCH_ATTEMPTS - 1) {
+                        MSSQLErrorClassifier.rethrowClassified(e)
+                    }
+                    log.warn(e) {
+                        "Batch write failed due to a connection failure; reconnecting (attempt ${attempt + 1}/$MAX_BATCH_ATTEMPTS)"
+                    }
+                    runCatching { reconnect() }
+                        .onFailure { log.warn(it) { "Reconnect attempt failed" } }
+                    Thread.sleep(2000L * (attempt + 1))
+                }
             }
-            preparedStatement.clearBatch()
-            preparedStatement.clearParameters()
-            connection.commit()
         }
     }
 
