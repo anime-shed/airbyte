@@ -175,6 +175,74 @@ const val MERGE_INSERT_ONLY_QUERY =
         ;
     """
 
+// Schema used for transient staging tables when writing to foreign tables.
+// Scratch objects are created from the target's column definitions (no IDENTITY
+// property, no constraints) and are dropped when the batch is committed.
+const val SCRATCH_SCHEMA_NAME = "airbyte_stage"
+
+const val GET_COLUMN_DEFINITIONS_QUERY =
+    """
+        SELECT c.name AS COLUMN_NAME, ty.name AS TYPE_NAME,
+               c.max_length AS MAX_LENGTH, c.precision AS PRECISION_VAL,
+               c.scale AS SCALE_VAL, c.is_nullable AS IS_NULLABLE
+        FROM sys.columns c
+        JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+        JOIN sys.tables t ON c.object_id = t.object_id
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE s.name = ? AND t.name = ?
+        ORDER BY c.column_id
+    """
+
+const val CREATE_SCRATCH_TABLE_QUERY =
+    """
+        IF OBJECT_ID('?$SCHEMA_KEY.?$TABLE_KEY') IS NULL
+        BEGIN
+            CREATE TABLE [?$SCHEMA_KEY].[?$TABLE_KEY]
+            (
+                ?$COLUMNS_KEY
+            );
+        END
+    """
+
+const val DROP_TABLE_IF_EXISTS_QUERY = """
+        IF OBJECT_ID('?.?') IS NOT NULL DROP TABLE [?].[?];
+    """
+
+// Plain INSERT ... VALUES form. Keep it exactly like this: the mssql-jdbc
+// useBulkCopyForBatchInsert optimization only pattern-matches this shape.
+const val INSERT_INTO_VALUES_QUERY =
+    """
+        INSERT INTO [?$SCHEMA_KEY].[?$TABLE_KEY] (?$COLUMNS_KEY)
+            VALUES (?$TEMPLATE_COLUMNS_KEY)
+    """
+
+private const val SCRATCH_SCHEMA_KEY = "scratchSchema"
+private const val SCRATCH_TABLE_KEY = "scratchTable"
+private const val KEY_LIST_KEY = "keyList"
+private const val KEY_MATCH_KEY = "keyMatch"
+
+// Set-based insert-only dedup: copy rows from the scratch table into the target
+// where the key is not already present, de-duplicating repeated keys inside the
+// scratch itself. Never updates or deletes existing target rows.
+const val INSERT_MISSING_FROM_SCRATCH_QUERY =
+    """
+        SET NOCOUNT ON;
+        INSERT INTO [?$SCHEMA_KEY].[?$TABLE_KEY] WITH (TABLOCK) (?$COLUMNS_KEY)
+        SELECT ?$COLUMNS_KEY
+        FROM (
+            SELECT s.*, ROW_NUMBER() OVER (
+                PARTITION BY ?$KEY_LIST_KEY ORDER BY (SELECT NULL)
+            ) AS _ab_rn
+            FROM [?$SCRATCH_SCHEMA_KEY].[?$SCRATCH_TABLE_KEY] s
+        ) d
+        WHERE d._ab_rn = 1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM [?$SCHEMA_KEY].[?$TABLE_KEY] t
+              WHERE ?$KEY_MATCH_KEY
+          );
+    """
+
 const val ALTER_TABLE_ADD = """
         ALTER TABLE [?].[?]
         ADD [?] ? NULL;
@@ -447,12 +515,126 @@ class MSSQLQueryBuilder(
         }
 
     fun setIdentityInsert(connection: Connection, enabled: Boolean) {
+        setIdentityInsert(connection, outputSchema, tableName, enabled)
+    }
+
+    fun setIdentityInsert(connection: Connection, schema: String, table: String, enabled: Boolean) {
         // Must go through a raw Statement (TDS batch). PreparedStatement executes as an
         // sp_executesql RPC whose SET options revert when the nested batch returns.
-        val sql =
-            "SET IDENTITY_INSERT [$outputSchema].[$tableName] ${if (enabled) "ON" else "OFF"}"
+        val sql = "SET IDENTITY_INSERT [$schema].[$table] ${if (enabled) "ON" else "OFF"}"
         connection.createStatement().use { it.execute(sql) }
-        logger.info { "IDENTITY_INSERT [$outputSchema].[$tableName] set to ${if (enabled) "ON" else "OFF"}" }
+        logger.info { "IDENTITY_INSERT [$schema].[$table] set to ${if (enabled) "ON" else "OFF"}" }
+    }
+
+    /** Whether the foreign-table fast path should stage writes through a scratch table. */
+    fun usesScratchTable(): Boolean = isForeignTable && uniquenessKey.isNotEmpty()
+
+    /** Unique scratch table name (within [SCRATCH_SCHEMA_NAME]) for one loader batch. */
+    fun scratchTableName(batch: Int): String {
+        val suffix = "_ab_$batch"
+        return tableName.take(110 - suffix.length) + suffix
+    }
+
+    fun ensureScratchSchema(connection: Connection) {
+        CREATE_SCHEMA_QUERY.executeUpdate(connection, SCRATCH_SCHEMA_NAME)
+    }
+
+    private fun sqlTypeString(
+        typeName: String,
+        maxLength: Int,
+        precision: Int,
+        scale: Int
+    ): String =
+        when (typeName.lowercase()) {
+            "varchar", "char", "varbinary", "binary" ->
+                "$typeName(${if (maxLength == -1) "max" else maxLength.toString()})"
+            "nvarchar", "nchar" ->
+                "$typeName(${if (maxLength == -1) "max" else (maxLength / 2).toString()})"
+            "decimal", "numeric" -> "$typeName($precision,$scale)"
+            "datetime2", "datetimeoffset", "time" -> "$typeName($scale)"
+            else -> typeName
+        }
+
+    /**
+     * Creates the scratch staging table with the target's column definitions (IDENTITY,
+     * defaults and constraints intentionally dropped so explicit values can always be
+     * bulk-inserted). Committed by the caller so the table survives reconnects.
+     */
+    fun createScratchTable(connection: Connection, scratchName: String) {
+        val columnDefs = mutableListOf<String>()
+        GET_COLUMN_DEFINITIONS_QUERY.executeQuery(connection, outputSchema, tableName) { rs ->
+            while (rs.next()) {
+                val type =
+                    sqlTypeString(
+                        rs.getString("TYPE_NAME"),
+                        rs.getInt("MAX_LENGTH"),
+                        rs.getInt("PRECISION_VAL"),
+                        rs.getInt("SCALE_VAL"),
+                    )
+                val nullable = if (rs.getBoolean("IS_NULLABLE")) "NULL" else "NOT NULL"
+                columnDefs.add("[${rs.getString("COLUMN_NAME")}] $type $nullable")
+            }
+        }
+        check(columnDefs.isNotEmpty()) {
+            "No columns found for [$outputSchema].[$tableName] while creating scratch table"
+        }
+        CREATE_SCRATCH_TABLE_QUERY.toQuery(
+                mapOf(
+                    SCHEMA_KEY to SCRATCH_SCHEMA_NAME,
+                    TABLE_KEY to scratchName,
+                    COLUMNS_KEY to columnDefs.joinToString(DEFAULT_SEPARATOR),
+                )
+            )
+            .executeUpdate(connection)
+    }
+
+    fun dropScratchTable(connection: Connection, scratchName: String) {
+        DROP_TABLE_IF_EXISTS_QUERY.toQuery(
+                SCRATCH_SCHEMA_NAME,
+                scratchName,
+                SCRATCH_SCHEMA_NAME,
+                scratchName,
+            )
+            .executeUpdate(connection)
+    }
+
+    /** INSERT into the scratch table: stream columns only, plain VALUES form. */
+    fun getScratchInsertColumnHeader(scratchName: String): String {
+        val columns = insertTableSchema.joinToString(", ") { "[${it.name}]" }
+        val templateColumns = insertTableSchema.joinToString(", ") { "?" }
+        return INSERT_INTO_VALUES_QUERY.toQuery(
+            mapOf(
+                SCHEMA_KEY to SCRATCH_SCHEMA_NAME,
+                TABLE_KEY to scratchName,
+                COLUMNS_KEY to columns,
+                TEMPLATE_COLUMNS_KEY to templateColumns,
+            )
+        )
+    }
+
+    /**
+     * One set-based insert-only dedup from scratch into the target: keeps the first row per
+     * uniqueness key inside the scratch and skips keys already present in the target.
+     */
+    fun insertMissingFromScratch(connection: Connection, scratchName: String) {
+        val columns = insertTableSchema.joinToString(", ") { "[${it.name}]" }
+        val keyList = uniquenessKey.joinToString(", ") { "s.[$it]" }
+        val keyMatch =
+            uniquenessKey.joinToString(" AND ") {
+                "(t.[$it] = d.[$it] OR (t.[$it] IS NULL AND d.[$it] IS NULL))"
+            }
+        INSERT_MISSING_FROM_SCRATCH_QUERY.toQuery(
+                mapOf(
+                    SCHEMA_KEY to outputSchema,
+                    TABLE_KEY to tableName,
+                    COLUMNS_KEY to columns,
+                    KEY_LIST_KEY to keyList,
+                    KEY_MATCH_KEY to keyMatch,
+                    SCRATCH_SCHEMA_KEY to SCRATCH_SCHEMA_NAME,
+                    SCRATCH_TABLE_KEY to scratchName,
+                )
+            )
+            .executeUpdate(connection)
     }
 
     fun deleteCdc(connection: Connection) {
