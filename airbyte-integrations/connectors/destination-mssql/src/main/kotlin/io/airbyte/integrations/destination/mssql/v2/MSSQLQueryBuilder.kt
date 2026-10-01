@@ -286,44 +286,55 @@ class MSSQLQueryBuilder(
     val insertTableSchema: List<NamedField>
         get() = if (isForeignTable) dataTableSchema else finalTableSchema
 
-    private fun getExistingSchema(connection: Connection): List<NamedSqlField> {
-        val fields = mutableListOf<NamedSqlField>()
+    private data class ExistingColumn(val name: String, val typeName: String)
+
+    private fun getExistingColumns(connection: Connection): List<ExistingColumn> {
+        val columns = mutableListOf<ExistingColumn>()
         GET_EXISTING_SCHEMA_QUERY.executeQuery(connection, outputSchema, tableName) { rs ->
             while (rs.next()) {
-                val name = rs.getString("COLUMN_NAME")
-                val typeName = rs.getString("DATA_TYPE").uppercase()
-                val type =
-                    runCatching { MssqlType.valueOf(typeName) }.getOrElse {
-                        logger.warn {
-                            "Column $name in [$outputSchema].[$tableName] has unsupported" +
-                                " type $typeName; skipping it in schema comparison"
-                        }
-                        null
-                    }
-                if (type != null) {
-                    fields.add(NamedSqlField(name, type))
-                }
+                columns.add(
+                    ExistingColumn(
+                        rs.getString("COLUMN_NAME"),
+                        rs.getString("DATA_TYPE").uppercase()
+                    )
+                )
             }
         }
-        return fields
+        return columns
     }
+
+    private fun getExistingSchema(
+        connection: Connection,
+        existingColumns: List<ExistingColumn>
+    ): List<NamedSqlField> =
+        existingColumns.mapNotNull { column ->
+            runCatching { MssqlType.valueOf(column.typeName) }.getOrElse {
+                logger.warn {
+                    "Column ${column.name} in [$outputSchema].[$tableName] has unsupported" +
+                        " type ${column.typeName}; skipping it in schema comparison"
+                }
+                null
+            }?.let { NamedSqlField(column.name, it) }
+        }
 
     private fun getSchema(): List<NamedSqlField> =
         finalTableSchema.map { NamedSqlField(it.name, toMssqlType.convert(it.type.type)) }
 
     fun updateSchema(connection: Connection) {
-        val existingSchema = getExistingSchema(connection)
+        val existingColumns = getExistingColumns(connection)
 
         // A pre-existing table without Airbyte's internal columns is user-managed.
         // Never run DDL against it; writes will use stream columns only.
-        if (existingSchema.isNotEmpty() && existingSchema.none { it.name in airbyteFields }) {
+        if (existingColumns.isNotEmpty() && existingColumns.none { it.name in airbyteFields }) {
             isForeignTable = true
-            logger.warn {
+            logger.info {
                 "Table [$outputSchema].[$tableName] is user-managed;" +
-                    " skipping schema evolution"
+                    " skipping schema evolution and writing stream columns only"
             }
             return
         }
+
+        val existingSchema = getExistingSchema(connection, existingColumns)
 
         val expectedSchema = getSchema()
 
