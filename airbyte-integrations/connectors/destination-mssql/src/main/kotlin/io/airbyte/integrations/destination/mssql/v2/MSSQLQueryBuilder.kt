@@ -571,8 +571,9 @@ class MSSQLQueryBuilder(
                         rs.getInt("PRECISION_VAL"),
                         rs.getInt("SCALE_VAL"),
                     )
-                val nullable = if (rs.getBoolean("IS_NULLABLE")) "NULL" else "NOT NULL"
-                columnDefs.add("[${rs.getString("COLUMN_NAME")}] $type $nullable")
+                // Scratch columns are always nullable: the stream may legitimately omit
+                // NOT NULL target columns (e.g. a deselected regenerated identity key).
+                columnDefs.add("[${rs.getString("COLUMN_NAME")}] $type NULL")
             }
         }
         check(columnDefs.isNotEmpty()) {
