@@ -36,6 +36,7 @@ import kotlin.random.Random
 @Requires(property = MODE_PROPERTY, value = "concurrent")
 class MsSqlServerConcurrentPartitionsCreatorFactory(
     partitionFactory: MsSqlServerJdbcPartitionFactory,
+    private val metadataQuerierFactory: MsSqlSourceMetadataQuerier.Factory,
 ) :
     JdbcPartitionsCreatorFactory<
         DefaultJdbcSharedState,
@@ -49,7 +50,7 @@ class MsSqlServerConcurrentPartitionsCreatorFactory(
         DefaultJdbcSharedState,
         DefaultJdbcStreamState,
         MsSqlServerJdbcPartition,
-    > = MsSqlServerConcurrentPartitionsCreator(partition, partitionFactory)
+    > = MsSqlServerConcurrentPartitionsCreator(partition, partitionFactory, metadataQuerierFactory)
 }
 
 /**
@@ -67,6 +68,7 @@ class MsSqlServerConcurrentPartitionsCreator(
             DefaultJdbcStreamState,
             MsSqlServerJdbcPartition,
         >,
+    private val metadataQuerierFactory: MsSqlSourceMetadataQuerier.Factory,
 ) :
     JdbcConcurrentPartitionsCreator<
         DefaultJdbcSharedState,
@@ -75,6 +77,50 @@ class MsSqlServerConcurrentPartitionsCreator(
     >(partition, partitionFactory) {
 
     private val log = KotlinLogging.logger {}
+
+    private val metadataQuerier: MsSqlSourceMetadataQuerier by lazy {
+        metadataQuerierFactory.session(
+            sharedState.configuration as MsSqlServerSourceConfiguration
+        ) as MsSqlSourceMetadataQuerier
+    }
+
+    /**
+     * Resumable chunked reads emit `SELECT TOP n ... WHERE <checkpoint> > ? ORDER BY
+     * <checkpoint>`, which is only cheap when the checkpoint columns are ordered by the table's
+     * clustered index. When the cursor isn't clustered-index-ordered (e.g. a date key that is a
+     * secondary PK column), every chunk degenerates into a full scan + sort, so a single
+     * non-resumable filtered scan is far cheaper.
+     */
+    private fun isCheckpointOrderedByClusteredIndex(
+        splittable: JdbcSplittablePartition<*>
+    ): Boolean {
+        val resumable = splittable as? MsSqlServerJdbcResumablePartition ?: return false
+        val checkpointIds: List<String> = resumable.checkpointColumns.map { it.id }
+        val table =
+            metadataQuerier.findTableName(stream.id) ?: return false
+        val clusteredColumns: List<String> =
+            metadataQuerier.memoizedClusteredIndexKeys[table]?.flatten().orEmpty()
+        return clusteredColumns.isNotEmpty() &&
+            checkpointIds.size <= clusteredColumns.size &&
+            checkpointIds.indices.all { i ->
+                clusteredColumns[i].equals(checkpointIds[i], ignoreCase = true)
+            }
+    }
+
+    private fun unsplitReader(splittable: JdbcSplittablePartition<*>): PartitionReader =
+        if (isCheckpointOrderedByClusteredIndex(splittable)) {
+            log.info {
+                "Partition was not split; using resumable partition reader" +
+                    " for periodic checkpoints"
+            }
+            JdbcResumablePartitionReader(splittable)
+        } else {
+            log.info {
+                "Partition was not split and checkpoint columns are not clustered-index-ordered;" +
+                    " using a single non-resumable scan"
+            }
+            JdbcNonResumablePartitionReader(partition)
+        }
 
     override suspend fun run(): List<PartitionReader> {
         // Ensure that the cursor upper bound is known, if required.
@@ -146,18 +192,16 @@ class MsSqlServerConcurrentPartitionsCreator(
         // lead to division by zero the in the split() function. Fall back to single partition.
         if (splitBoundaries.isEmpty()) {
             log.warn { "No split boundaries found, using single partition" }
-            return listOf(JdbcResumablePartitionReader(splittable))
+            return listOf(unsplitReader(splittable))
         }
         val partitions: List<MsSqlServerJdbcPartition> =
             partitionFactory.split(partition, splitBoundaries)
         if (partitions.size <= 1) {
             // Splittable but not split (e.g. resumed cursor-incremental range): read it
-            // resumably so the cursor checkpoints after every chunk.
-            log.info {
-                "Partition was not split; using resumable partition reader" +
-                    " for periodic checkpoints"
-            }
-            return listOf(JdbcResumablePartitionReader(splittable))
+            // resumably so the cursor checkpoints after every chunk — but only when the
+            // checkpoint ordering matches the clustered index, otherwise each chunk query
+            // degenerates into a full table scan + sort.
+            return listOf(unsplitReader(splittable))
         }
         log.info { "Table will be read by ${partitions.size} concurrent partition reader(s)." }
         return partitions.map { JdbcNonResumablePartitionReader(it) }
