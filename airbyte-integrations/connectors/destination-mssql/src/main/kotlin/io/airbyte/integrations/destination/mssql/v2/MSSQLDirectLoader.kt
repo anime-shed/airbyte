@@ -40,9 +40,25 @@ class MSSQLDirectLoader(
             ?: throw IllegalStateException("No state found for stream $streamDescriptor.")
     private val sqlBuilder = state.sqlBuilder
     private var connection = state.dataSource.connection.also { it.autoCommit = false }
+
+    /**
+     * Fast path for user-managed tables with a dedup key: rows are bulk-inserted into a
+     * per-batch scratch table in [SCRATCH_SCHEMA_NAME], then a single set-based
+     * INSERT ... WHERE NOT EXISTS copies only missing keys into the target. This replaces a
+     * per-record MERGE with one set operation per batch.
+     */
+    private val scratchTable: String? =
+        if (sqlBuilder.usesScratchTable()) sqlBuilder.scratchTableName(batch) else null
+
+    private val targetHasIdentity =
+        sqlBuilder.isForeignTable && sqlBuilder.hasIdentityColumn(connection)
+
+    // Scratch tables are created without the IDENTITY property, so the flag is only needed
+    // on the target — either for the session (direct path) or around the final dedup insert
+    // (scratch path).
     private val identityInsertEnabled =
-        sqlBuilder.isForeignTable &&
-            sqlBuilder.hasIdentityColumn(connection).also { hasIdentity ->
+        scratchTable == null &&
+            targetHasIdentity.also { hasIdentity ->
                 if (hasIdentity) {
                     log.info {
                         "Foreign table has an identity column; enabling IDENTITY_INSERT for this session"
@@ -50,8 +66,22 @@ class MSSQLDirectLoader(
                     sqlBuilder.setIdentityInsert(connection, true)
                 }
             }
+
+    init {
+        scratchTable?.let {
+            sqlBuilder.ensureScratchSchema(connection)
+            sqlBuilder.createScratchTable(connection, it)
+            // Commit the DDL so the scratch table survives connection reconnects.
+            connection.commit()
+        }
+    }
+
     private var preparedStatement =
-        connection.prepareStatement(state.sqlBuilder.getFinalTableInsertColumnHeader().trimIndent())
+        connection.prepareStatement(
+            (scratchTable?.let { sqlBuilder.getScratchInsertColumnHeader(it) }
+                    ?: sqlBuilder.getFinalTableInsertColumnHeader())
+                .trimIndent()
+        )
     private val pendingRecords = ArrayList<DestinationRecordRaw>(recordCommitBatchSize)
 
     override suspend fun accept(
@@ -84,12 +114,19 @@ class MSSQLDirectLoader(
         runCatching { preparedStatement.close() }
         runCatching { connection.close() }
         connection = state.dataSource.connection.also { it.autoCommit = false }
+        scratchTable?.let {
+            sqlBuilder.ensureScratchSchema(connection)
+            sqlBuilder.createScratchTable(connection, it)
+            connection.commit()
+        }
         if (identityInsertEnabled) {
             sqlBuilder.setIdentityInsert(connection, true)
         }
         preparedStatement =
             connection.prepareStatement(
-                state.sqlBuilder.getFinalTableInsertColumnHeader().trimIndent()
+                (scratchTable?.let { sqlBuilder.getScratchInsertColumnHeader(it) }
+                        ?: state.sqlBuilder.getFinalTableInsertColumnHeader())
+                    .trimIndent()
             )
     }
 
@@ -136,6 +173,9 @@ class MSSQLDirectLoader(
         executeBatchSafely()
         preparedStatement.close()
 
+        // Flush the scratch staging table into the target with insert-only dedup
+        scratchTable?.let { commitScratchToTarget(it) }
+
         // If CDC is enabled, remove stale records
         if (sqlBuilder.hasCdc) {
             sqlBuilder.deleteCdc(connection)
@@ -144,11 +184,48 @@ class MSSQLDirectLoader(
         connection.commit()
     }
 
+    private fun commitScratchToTarget(scratchName: String) {
+        var identityOn = false
+        try {
+            if (targetHasIdentity) {
+                sqlBuilder.setIdentityInsert(
+                    connection,
+                    sqlBuilder.outputSchema,
+                    sqlBuilder.tableName,
+                    true
+                )
+                identityOn = true
+            }
+            sqlBuilder.insertMissingFromScratch(connection, scratchName)
+            connection.commit()
+        } finally {
+            if (identityOn) {
+                runCatching {
+                        sqlBuilder.setIdentityInsert(
+                            connection,
+                            sqlBuilder.outputSchema,
+                            sqlBuilder.tableName,
+                            false
+                        )
+                    }
+                    .onFailure { log.warn(it) { "Failed to reset IDENTITY_INSERT" } }
+            }
+            runCatching { sqlBuilder.dropScratchTable(connection, scratchName) }
+                .onFailure { log.warn(it) { "Failed to drop scratch table $scratchName" } }
+            runCatching { connection.commit() }
+        }
+    }
+
     override fun close() {
         log.info { "Closing connection for batch $batch" }
         if (identityInsertEnabled) {
             runCatching { sqlBuilder.setIdentityInsert(connection, false) }
                 .onFailure { log.warn(it) { "Failed to reset IDENTITY_INSERT" } }
+        }
+        // Best-effort cleanup if the batch failed before finish() could commit.
+        scratchTable?.let {
+            runCatching { sqlBuilder.dropScratchTable(connection, it) }
+            runCatching { connection.commit() }
         }
         connection.close()
     }
