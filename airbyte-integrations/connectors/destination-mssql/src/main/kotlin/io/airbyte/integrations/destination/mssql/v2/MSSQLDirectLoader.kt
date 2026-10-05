@@ -31,6 +31,7 @@ class MSSQLDirectLoader(
 
     private companion object {
         const val MAX_BATCH_ATTEMPTS = 5
+        const val MAX_DEDUP_ATTEMPTS = 5
         const val STATE_WAIT_TIMEOUT_MS = 300_000L
         const val STATE_WAIT_POLL_MS = 100L
     }
@@ -121,6 +122,10 @@ class MSSQLDirectLoader(
             e.message?.contains("Connection reset", ignoreCase = true) == true ||
             e.message?.contains("Connection is closed", ignoreCase = true) == true
 
+    private fun isDeadlock(e: SQLException): Boolean =
+        e.errorCode == 1205 || e.sqlState == "40001" ||
+            e.message?.contains("deadlock", ignoreCase = true) == true
+
     private fun reconnect() {
         runCatching { preparedStatement.close() }
         runCatching { connection.close() }
@@ -198,17 +203,35 @@ class MSSQLDirectLoader(
     private fun commitScratchToTarget(scratchName: String) {
         var identityOn = false
         try {
-            if (targetHasIdentity) {
-                sqlBuilder.setIdentityInsert(
-                    connection,
-                    sqlBuilder.outputSchema,
-                    sqlBuilder.tableName,
-                    true
-                )
-                identityOn = true
+            // Concurrent partition loaders issue anti-join inserts into the same
+            // target table; serialize them and retry transient deadlocks.
+            synchronized(parent) {
+                repeat(MAX_DEDUP_ATTEMPTS) { attempt ->
+                    try {
+                        if (targetHasIdentity && !identityOn) {
+                            sqlBuilder.setIdentityInsert(
+                                connection,
+                                sqlBuilder.outputSchema,
+                                sqlBuilder.tableName,
+                                true
+                            )
+                            identityOn = true
+                        }
+                        sqlBuilder.insertMissingFromScratch(connection, scratchName)
+                        connection.commit()
+                        return
+                    } catch (e: SQLException) {
+                        if (!isDeadlock(e) || attempt == MAX_DEDUP_ATTEMPTS - 1) {
+                            throw e
+                        }
+                        log.warn {
+                            "Dedup insert deadlocked; retrying (attempt ${attempt + 1}/$MAX_DEDUP_ATTEMPTS)"
+                        }
+                        runCatching { connection.rollback() }
+                        Thread.sleep(2000L * (attempt + 1))
+                    }
+                }
             }
-            sqlBuilder.insertMissingFromScratch(connection, scratchName)
-            connection.commit()
         } finally {
             if (identityOn) {
                 runCatching {
