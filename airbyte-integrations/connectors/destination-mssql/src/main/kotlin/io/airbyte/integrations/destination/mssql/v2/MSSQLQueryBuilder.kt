@@ -274,7 +274,7 @@ const val DELETE_WHERE_COL_LESS_THAN =
 
 const val HAS_IDENTITY_COLUMN_QUERY =
     """
-        SELECT COUNT(*)
+        SELECT c.name
         FROM sys.columns c
         JOIN sys.tables t ON c.object_id = t.object_id
         JOIN sys.schemas s ON t.schema_id = s.schema_id
@@ -506,12 +506,20 @@ class MSSQLQueryBuilder(
     }
 
     /**
-     * True when a user-managed table has an IDENTITY column. Explicit identity values then
-     * require SET IDENTITY_INSERT ON for the session (a session flag, not DDL).
+     * True when a user-managed table's IDENTITY column is one of the columns we insert.
+     * Only then do explicit identity values require SET IDENTITY_INSERT ON (a session flag,
+     * not DDL). If the identity column was deselected from the stream, the insert must let
+     * the table generate values — enabling IDENTITY_INSERT would make SQL Server reject it.
      */
     fun hasIdentityColumn(connection: Connection): Boolean =
         HAS_IDENTITY_COLUMN_QUERY.executeQuery(connection, outputSchema, tableName) { rs ->
-            rs.next() && rs.getInt(1) > 0
+            var found = false
+            while (rs.next()) {
+                if (insertTableSchema.any { it.name.equals(rs.getString(1), true) }) {
+                    found = true
+                }
+            }
+            found
         }
 
     fun setIdentityInsert(connection: Connection, enabled: Boolean) {
