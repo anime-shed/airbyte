@@ -31,13 +31,24 @@ class MSSQLDirectLoader(
 
     private companion object {
         const val MAX_BATCH_ATTEMPTS = 5
+        const val STATE_WAIT_TIMEOUT_MS = 300_000L
+        const val STATE_WAIT_POLL_MS = 100L
     }
 
     private var dataSize: Long = 0
 
-    private val state =
-        (stateStore.get(streamDescriptor) as MSSQLDirectLoaderStreamState?)
-            ?: throw IllegalStateException("No state found for stream $streamDescriptor.")
+    // Stream setup (which registers the loader state) runs concurrently with the
+    // accumulator tasks; records can arrive before start() completes, so wait
+    // briefly for the state instead of failing the batch.
+    private val state = run {
+        val deadline = System.currentTimeMillis() + STATE_WAIT_TIMEOUT_MS
+        var s = stateStore.get(streamDescriptor) as MSSQLDirectLoaderStreamState?
+        while (s == null && System.currentTimeMillis() < deadline) {
+            Thread.sleep(STATE_WAIT_POLL_MS)
+            s = stateStore.get(streamDescriptor) as MSSQLDirectLoaderStreamState?
+        }
+        s ?: throw IllegalStateException("No state found for stream $streamDescriptor.")
+    }
     private val sqlBuilder = state.sqlBuilder
     private var connection = state.dataSource.connection.also { it.autoCommit = false }
 
