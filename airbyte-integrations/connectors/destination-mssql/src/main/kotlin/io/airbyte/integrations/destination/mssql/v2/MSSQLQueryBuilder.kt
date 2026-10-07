@@ -218,29 +218,27 @@ const val INSERT_INTO_VALUES_QUERY =
 
 private const val SCRATCH_SCHEMA_KEY = "scratchSchema"
 private const val SCRATCH_TABLE_KEY = "scratchTable"
-private const val KEY_LIST_KEY = "keyList"
-private const val KEY_MATCH_KEY = "keyMatch"
+private const val DEDUP_PARTITIONS_KEY = "dedupPartitions"
+private const val RN_FILTER_KEY = "rnFilter"
+private const val KEY_MATCHES_KEY = "keyMatches"
 
 // Set-based insert-only dedup: copy rows from the scratch table into the target
-// where the key is not already present, de-duplicating repeated keys inside the
-// scratch itself. Never updates or deletes existing target rows.
+// where no key is already present, de-duplicating repeated keys inside the
+// scratch itself. Every unique index on the target (PK, unique constraints,
+// unique indexes) contributes a keyset — a unique index defines what the target
+// considers a duplicate, and inserting a colliding row would raise a key
+// violation. Never updates or deletes existing target rows.
 const val INSERT_MISSING_FROM_SCRATCH_QUERY =
     """
         SET NOCOUNT ON;
         INSERT INTO [?$SCHEMA_KEY].[?$TABLE_KEY] WITH (TABLOCK) (?$COLUMNS_KEY)
         SELECT ?$COLUMNS_KEY
         FROM (
-            SELECT s.*, ROW_NUMBER() OVER (
-                PARTITION BY ?$KEY_LIST_KEY ORDER BY (SELECT NULL)
-            ) AS _ab_rn
+            SELECT s.*, ?$DEDUP_PARTITIONS_KEY
             FROM [?$SCRATCH_SCHEMA_KEY].[?$SCRATCH_TABLE_KEY] s
         ) d
-        WHERE d._ab_rn = 1
-          AND NOT EXISTS (
-              SELECT 1
-              FROM [?$SCHEMA_KEY].[?$TABLE_KEY] t
-              WHERE ?$KEY_MATCH_KEY
-          );
+        WHERE ?$RN_FILTER_KEY
+          AND ?$KEY_MATCHES_KEY;
     """
 
 const val ALTER_TABLE_ADD = """
@@ -279,6 +277,20 @@ const val HAS_IDENTITY_COLUMN_QUERY =
         JOIN sys.tables t ON c.object_id = t.object_id
         JOIN sys.schemas s ON t.schema_id = s.schema_id
         WHERE s.name = ? AND t.name = ? AND c.is_identity = 1
+    """
+
+const val UNIQUE_INDEXES_QUERY =
+    """
+        SELECT i.index_id, c.name
+        FROM sys.indexes i
+        JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            AND ic.is_included_column = 0
+        JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+        JOIN sys.tables t ON t.object_id = i.object_id
+        JOIN sys.schemas s ON s.schema_id = t.schema_id
+        WHERE s.name = ? AND t.name = ? AND i.is_unique = 1 AND i.has_filter = 0
+        ORDER BY i.index_id, ic.key_ordinal
     """
 
 const val SELECT_FROM = """
@@ -622,23 +634,66 @@ class MSSQLQueryBuilder(
     }
 
     /**
+     * Unique-index key column sets present on the target table (primary key, unique
+     * constraints and unique indexes; filtered indexes excluded). Each one defines a set of
+     * rows the target treats as identical, so dedup must respect all of them.
+     */
+    fun targetUniqueKeySets(connection: Connection): List<List<String>> {
+        val sets = linkedMapOf<Int, MutableList<String>>()
+        UNIQUE_INDEXES_QUERY.executeQuery(connection, outputSchema, tableName) { rs ->
+            while (rs.next()) {
+                sets.getOrPut(rs.getInt(1)) { mutableListOf() }.add(rs.getString(2))
+            }
+        }
+        return sets.values.toList()
+    }
+
+    /**
      * One set-based insert-only dedup from scratch into the target: keeps the first row per
-     * uniqueness key inside the scratch and skips keys already present in the target.
+     * keyset inside the scratch and skips rows colliding with any target unique index —
+     * the configured stream key plus every other unique key the target enforces. Keysets
+     * containing columns absent from the stream are skipped (their scratch values would
+     * be NULL and could never be bound).
      */
     fun insertMissingFromScratch(connection: Connection, scratchName: String) {
         val columns = insertTableSchema.joinToString(", ") { "[${it.name}]" }
-        val keyList = uniquenessKey.joinToString(", ") { "s.[$it]" }
-        val keyMatch =
-            uniquenessKey.joinToString(" AND ") {
-                "(t.[$it] = d.[$it] OR (t.[$it] IS NULL AND d.[$it] IS NULL))"
+        val streamCols = insertTableSchema.map { it.name.lowercase() }.toSet()
+        val keySets = mutableListOf(uniquenessKey)
+        for (keyset in targetUniqueKeySets(connection)) {
+            if (keyset.size == uniquenessKey.size &&
+                keyset.all { col -> uniquenessKey.any { it.equals(col, true) } }
+            ) {
+                continue
+            }
+            if (keyset.all { streamCols.contains(it.lowercase()) }) {
+                keySets.add(keyset)
+            }
+        }
+        val dedupPartitions =
+            keySets.mapIndexed { i, keyset ->
+                keyset.joinToString(
+                    ", ",
+                    prefix = "ROW_NUMBER() OVER (PARTITION BY ",
+                    postfix = " ORDER BY (SELECT NULL))",
+                ) { "s.[$it]" } + " AS _ab_rn$i"
+            }.joinToString(", ")
+        val rnFilter = keySets.indices.joinToString(" AND ") { "d._ab_rn$it = 1" }
+        val keyMatches =
+            keySets.joinToString("\n          AND ") { keyset ->
+                keyset.joinToString(
+                    " AND ",
+                    prefix = "NOT EXISTS (SELECT 1 FROM [$outputSchema].[$tableName] t WHERE ",
+                    postfix = ")",
+                ) { "(t.[$it] = d.[$it] OR (t.[$it] IS NULL AND d.[$it] IS NULL))" }
             }
         INSERT_MISSING_FROM_SCRATCH_QUERY.toQuery(
                 mapOf(
                     SCHEMA_KEY to outputSchema,
                     TABLE_KEY to tableName,
                     COLUMNS_KEY to columns,
-                    KEY_LIST_KEY to keyList,
-                    KEY_MATCH_KEY to keyMatch,
+                    DEDUP_PARTITIONS_KEY to dedupPartitions,
+                    RN_FILTER_KEY to rnFilter,
+                    KEY_MATCHES_KEY to keyMatches,
                     SCRATCH_SCHEMA_KEY to SCRATCH_SCHEMA_NAME,
                     SCRATCH_TABLE_KEY to scratchName,
                 )

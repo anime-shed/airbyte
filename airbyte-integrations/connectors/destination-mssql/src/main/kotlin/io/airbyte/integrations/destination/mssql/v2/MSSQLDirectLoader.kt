@@ -221,13 +221,23 @@ class MSSQLDirectLoader(
                         connection.commit()
                         return
                     } catch (e: SQLException) {
-                        if (!isDeadlock(e) || attempt == MAX_DEDUP_ATTEMPTS - 1) {
+                        if (attempt == MAX_DEDUP_ATTEMPTS - 1 ||
+                            (!isDeadlock(e) && !isConnectionFailure(e))
+                        ) {
                             throw e
                         }
                         log.warn {
-                            "Dedup insert deadlocked; retrying (attempt ${attempt + 1}/$MAX_DEDUP_ATTEMPTS)"
+                            "Dedup insert failed transiently; retrying (attempt ${attempt + 1}/$MAX_DEDUP_ATTEMPTS)"
                         }
                         runCatching { connection.rollback() }
+                        if (isConnectionFailure(e)) {
+                            // Scratch rows are already committed and survive the
+                            // reconnect; the identity flag is session-scoped and
+                            // must be re-armed on the new connection.
+                            runCatching { reconnect() }
+                                .onFailure { log.warn(it) { "Reconnect attempt failed" } }
+                            identityOn = false
+                        }
                         Thread.sleep(2000L * (attempt + 1))
                     }
                 }
